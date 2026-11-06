@@ -1,7 +1,97 @@
 """Launch: python -m streamlit run app.py"""
 import numpy as np
 import streamlit as st
-from evaluation import BASE, load_models, parse_test_csv, evaluate_models
+
+import csv
+import io
+import pickle
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (accuracy_score, roc_auc_score, precision_score,
+    recall_score, f1_score, matthews_corrcoef, confusion_matrix, classification_report)
+
+BASE = Path(__file__).resolve().parent
+MODEL_FILES = {
+    'Logistic Regression': 'logistic_regression.pkl',
+    'Decision Tree': 'decision_tree.pkl',
+    'K-Nearest Neighbors': 'knn.pkl',
+    'Gaussian Naive Bayes': 'naive_bayes.pkl',
+    'Support Vector Machine': 'svm.pkl',
+}
+MAX_BYTES = 5 * 1024 * 1024
+MAX_ROWS = 5000
+
+
+def load_models():
+    models = {}
+    for name, filename in MODEL_FILES.items():
+        with (BASE / 'models' / filename).open('rb') as file:
+            models[name] = pickle.load(file)
+    return models
+
+
+def parse_test_csv(raw, feature_names):
+    if len(raw) > MAX_BYTES:
+        raise ValueError('CSV must be at most 5 MB. Upload test data only.')
+    try:
+        text = raw.decode('utf-8-sig')
+        header = next(csv.reader(io.StringIO(text)))
+    except (UnicodeDecodeError, StopIteration, csv.Error) as exc:
+        raise ValueError('Upload a nonempty UTF-8 CSV with a header.') from exc
+    if len(set(header)) != len(header):
+        raise ValueError('Duplicate column names are not allowed.')
+    expected = list(feature_names) + ['malignant']
+    missing = sorted(set(expected) - set(header))
+    extra = sorted(set(header) - set(expected))
+    if missing or extra:
+        raise ValueError(f'Column mismatch. Missing: {missing}. Unexpected: {extra}. Use the sample CSV headers.')
+    try:
+        frame = pd.read_csv(io.StringIO(text), nrows=MAX_ROWS + 1)
+    except (ValueError, pd.errors.ParserError) as exc:
+        raise ValueError('CSV could not be parsed. Use comma-separated columns.') from exc
+    if not 1 <= len(frame) <= MAX_ROWS:
+        raise ValueError('Upload between 1 and 5,000 test rows.')
+    try:
+        frame = frame.apply(pd.to_numeric, errors='raise')
+    except (TypeError, ValueError) as exc:
+        raise ValueError('All features and the target must be numeric.') from exc
+    if not np.isfinite(frame.to_numpy(dtype=float)).all():
+        raise ValueError('Missing values and infinite values are not allowed.')
+    if not frame['malignant'].isin([0, 1]).all():
+        raise ValueError('Target malignant must be 0 (benign) or 1 (malignant).')
+    return frame.loc[:, list(feature_names)], frame['malignant'].astype(int)
+
+
+def evaluate_models(models, X, y):
+    rows, details = [], {}
+    for name, model in models.items():
+        predicted = model.predict(X)
+        if hasattr(model, 'predict_proba'):
+            pos = list(model.classes_).index(1)
+            scores = model.predict_proba(X)[:, pos]
+        else:
+            if list(model.classes_) != [0, 1]:
+                raise ValueError('Unexpected saved model class order.')
+            scores = model.decision_function(X)
+        rows.append({'Model': name,
+            'Accuracy': accuracy_score(y, predicted),
+            'AUC': roc_auc_score(y, scores) if y.nunique() == 2 else np.nan,
+            'Precision': precision_score(y, predicted, pos_label=1, zero_division=0),
+            'Recall': recall_score(y, predicted, pos_label=1, zero_division=0),
+            'F1': f1_score(y, predicted, pos_label=1, zero_division=0),
+            'MCC': matthews_corrcoef(y, predicted)})
+        details[name] = {
+            'matrix': confusion_matrix(y, predicted, labels=[0, 1]),
+            'report': pd.DataFrame(classification_report(y, predicted, labels=[0, 1],
+                target_names=['Benign (0)', 'Malignant (1)'], output_dict=True,
+                zero_division=0)).T,
+            'predictions': pd.DataFrame({'actual_malignant': y.to_numpy(),
+                'predicted_malignant': predicted, 'malignant_score': scores}),
+        }
+    return pd.DataFrame(rows).set_index('Model'), details
+
 
 st.set_page_config(page_title='Classification Model Comparison', layout='wide')
 
